@@ -1,14 +1,16 @@
-# === SAS Files to Ignore ===
-
+# ===== SAS temporary & output files =====
 *.log
 *.lst
+
+# ODS outputs (only ignore if you generate them locally)
+output/
+outputs/
+results/
 *.rtf
-*.pdf
-*.html
-*.sasmacr
-
-# SAS Catalog and Utility Files
 *.sas7bcat
-
-# SAS Data Files 
 *.sas7bdat
+
+# SAS Studio / EG user state 
+*.sas7bndx
+*.sas7bvew
+*.sas7bdat.lock
