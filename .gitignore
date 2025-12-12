@@ -2,7 +2,7 @@
 *.log
 *.lst
 
-# ODS outputs (only ignore if you generate them locally)
+# ODS outputs
 output/
 outputs/
 results/
