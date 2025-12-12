@@ -1,0 +1,448 @@
+/*======================================================================
+STAT 448 Final Project (Group 10)
+Diabetes Risk Modeling (BRFSS subset: diabetes_S1.csv)
+
+Notes for GitHub:
+- The original project was run in SAS Studio (UIUC / SAS OnDemand style paths).
+- Update the DATAFILE path below to point to your local copy of diabetes_S1.csv.
+- This script is organized to reproduce:
+  (1) Recodes
+  (2) EDA plots & summaries
+  (3) Univariate logistic regressions
+  (4) Stepwise model selection
+  (5) Final model diagnostics (ROC, influence, confusion matrix)
+  (6) Model-comparison variants + sex-stratified analyses
+
+======================================================================*/
+
+options nodate nonumber;
+ods graphics on;
+
+/*-----------------------------*
+ | 0) Set your data file path  |
+ *-----------------------------*/
+%let DATAFILE=/path/to/diabetes_S1.csv;   /* <--- CHANGE THIS */
+
+/*-----------------------------*
+ | 1) Import data              |
+ *-----------------------------*/
+proc import datafile="&DATAFILE"
+    out=dia
+    dbms=csv
+    replace;
+    getnames=yes;
+    guessingrows=max;
+run;
+
+/*======================================================================
+2) Variable recodes
+IMPORTANT FIX: SAS does NOT support chained comparisons like:
+  4 <= x <= 13
+That evaluates incorrectly. Use:
+  4 <= x and x <= 13
+======================================================================*/
+
+data diaRcd;
+    set dia;
+
+    /* Mental Health (days not good in past 30) -> 5-level ordinal */
+    if missing(MentHlth) then mhRcd = .;
+    else if MentHlth < 4 then mhRcd = 1;
+    else if 4  <= MentHlth and MentHlth <= 13 then mhRcd = 2;
+    else if 14 <= MentHlth and MentHlth <= 16 then mhRcd = 3;
+    else if 17 <= MentHlth and MentHlth <= 27 then mhRcd = 4;
+    else if MentHlth > 27 then mhRcd = 5;
+
+    /* Physical Health (days not good in past 30) -> 5-level ordinal */
+    if missing(PhysHlth) then phRcd = .;
+    else if PhysHlth < 4 then phRcd = 1;
+    else if 4  <= PhysHlth and PhysHlth <= 13 then phRcd = 2;
+    else if 14 <= PhysHlth and PhysHlth <= 16 then phRcd = 3;
+    else if 17 <= PhysHlth and PhysHlth <= 27 then phRcd = 4;
+    else if PhysHlth > 27 then phRcd = 5;
+
+    /* BMI -> 6-level ordinal */
+    if missing(BMI) then bmiRcd = .;
+    else if BMI < 19 then bmiRcd = 1;
+    else if 19 <= BMI and BMI <= 24 then bmiRcd = 2;
+    else if 25 <= BMI and BMI <= 29 then bmiRcd = 3;
+    else if 30 <= BMI and BMI <= 34 then bmiRcd = 4;
+    else if 35 <= BMI and BMI <= 39 then bmiRcd = 5;
+    else if BMI > 39 then bmiRcd = 6;
+
+    /* BMI (Section 4 variant) -> 3-level ordinal */
+    if missing(BMI) then bmiRcd2 = .;
+    else if BMI < 25 then bmiRcd2 = 1;
+    else if 25 <= BMI and BMI <= 34 then bmiRcd2 = 2;
+    else if BMI >= 35 then bmiRcd2 = 3;
+run;
+
+/* Quick checks for recodes */
+title 'Frequency: Mental Health Recode';
+proc sgplot data=diaRcd; histogram mhRcd / nbins=5 transparency=0.8; run;
+proc sgscatter data=diaRcd; matrix MentHlth mhRcd; run;
+
+title 'Frequency: Physical Health Recode';
+proc sgplot data=diaRcd; histogram phRcd / nbins=5 transparency=0.8; run;
+proc sgscatter data=diaRcd; matrix PhysHlth phRcd; run;
+
+title 'Frequency: BMI Recode';
+proc sgplot data=diaRcd; histogram bmiRcd / nbins=6 transparency=0.8; run;
+proc sgscatter data=diaRcd; matrix BMI bmiRcd; run;
+
+/*======================================================================
+3) EDA: number summaries
+======================================================================*/
+title 'Binary Variables';
+proc means data=dia mean min q1 median q3 max;
+    var Diabetes_binary HighBP HighChol CholCheck Smoker Stroke
+        HeartDiseaseorAttack PhysActivity Fruits Veggies HvyAlcoholConsump
+        AnyHealthcare NoDocbcCost DiffWalk Sex;
+run;
+
+title 'Non-Binary Variables';
+proc means data=dia mean min q1 median q3 max;
+    var BMI GenHlth MentHlth PhysHlth Age Education Income;
+run;
+
+/*======================================================================
+4) Univariate logistic regressions (individual predictors)
+======================================================================*/
+%macro uni_log(var=, lab=);
+proc logistic data=dia;
+    model Diabetes_binary(event='1') = &var;
+    title "Logistic Regression: Diabetes vs &lab";
+run;
+%mend;
+
+title;
+
+*-- Comorbidities --*;
+%uni_log(var=HighBP,               lab=HighBP);
+%uni_log(var=HighChol,             lab=HighChol);
+%uni_log(var=Stroke,               lab=Stroke);
+%uni_log(var=HeartDiseaseorAttack, lab=HeartDiseaseorAttack);
+
+/* Optional: table of ORs used in report (hard-coded from your output) */
+data OR_All;
+    length Predictor $32.;
+    input Predictor $ OddsRatioEst LowerWaldCL UpperWaldCL;
+datalines;
+HighBP 4.514 3.446 5.913
+HighChol 2.908 2.249 3.761
+HeartDiseaseorAttack 3.076 2.101 4.504
+Stroke 2.540 1.397 4.618
+;
+run;
+
+proc print data=OR_All noobs label;
+    var Predictor OddsRatioEst LowerWaldCL UpperWaldCL;
+    label Predictor="Comorbidity"
+          OddsRatioEst="Odds Ratio (Point Estimate)"
+          LowerWaldCL="95% CI - Lower"
+          UpperWaldCL="95% CI - Upper";
+    title "Odds Ratio Estimates for Comorbidities";
+run;
+
+*-- Health metrics (raw) --*;
+%uni_log(var=BMI,     lab=BMI);
+%uni_log(var=MentHlth,lab=MentHlth);
+%uni_log(var=PhysHlth,lab=PhysHlth);
+%uni_log(var=DiffWalk,lab=DiffWalk);
+%uni_log(var=GenHlth, lab=GenHlth);
+
+*-- Health metrics (recoded) --*;
+proc logistic data=diaRcd; model Diabetes_binary(event='1') = mhRcd;  title "Logistic Regression: Diabetes vs mhRcd"; run;
+proc logistic data=diaRcd; model Diabetes_binary(event='1') = phRcd;  title "Logistic Regression: Diabetes vs phRcd"; run;
+proc logistic data=diaRcd; model Diabetes_binary(event='1') = bmiRcd; title "Logistic Regression: Diabetes vs bmiRcd"; run;
+
+*-- Medical care --*;
+%uni_log(var=CholCheck,     lab=CholCheck);
+%uni_log(var=AnyHealthcare, lab=AnyHealthcare);
+%uni_log(var=NoDocbcCost,   lab=NoDocbcCost);
+
+*-- Lifestyle --*;
+%uni_log(var=Smoker,           lab=Smoker);
+%uni_log(var=PhysActivity,     lab=PhysActivity);
+%uni_log(var=Fruits,           lab=Fruits);
+%uni_log(var=Veggies,          lab=Veggies);
+%uni_log(var=HvyAlcoholConsump,lab=HvyAlcoholConsump);
+
+*-- Demographics --*;
+%uni_log(var=Sex,       lab=Sex);
+%uni_log(var=Age,       lab=Age);
+%uni_log(var=Education, lab=Education);
+%uni_log(var=Income,    lab=Income);
+
+/*======================================================================
+5) EDA plots (as in your submitted code)
+======================================================================*/
+title 'Histograms';
+proc sgplot data=dia; histogram BMI / nbins=67 transparency=0.8; title 'Frequency: BMI'; run;
+proc sgplot data=dia; histogram GenHlth / nbins=5 transparency=0.8; title 'Frequency: General Health'; run;
+proc sgplot data=dia; histogram MentHlth / nbins=31 transparency=0.8; title 'Frequency: Mental Health'; run;
+proc sgplot data=dia; histogram PhysHlth / nbins=31 transparency=0.8; title 'Frequency: Physical Health'; run;
+proc sgplot data=dia; histogram Age / nbins=13 transparency=0.8; title 'Frequency: Age'; run;
+proc sgplot data=dia; histogram Education / nbins=5 transparency=0.8; title 'Frequency: Education'; run;
+proc sgplot data=dia; histogram Income / nbins=8 transparency=0.8; title 'Frequency: Income'; run;
+
+title 'Boxplots (continuous/ordinal vs Diabetes)';
+proc sgplot data=dia; vbox BMI       / category=Diabetes_binary; run;
+proc sgplot data=dia; vbox GenHlth   / category=Diabetes_binary; run;
+proc sgplot data=dia; vbox MentHlth  / category=Diabetes_binary; run;
+proc sgplot data=dia; vbox PhysHlth  / category=Diabetes_binary; run;
+proc sgplot data=dia; vbox Age       / category=Diabetes_binary; run;
+proc sgplot data=dia; vbox Education / category=Diabetes_binary; run;
+proc sgplot data=dia; vbox Income    / category=Diabetes_binary; run;
+
+title 'Stacked Bar Charts (selected)';
+proc sgplot data=dia; vbar Age       / group=Diabetes_binary groupdisplay=stack; run;
+proc sgplot data=dia; vbar Education / group=Diabetes_binary groupdisplay=stack; run;
+proc sgplot data=dia; vbar Income    / group=Diabetes_binary groupdisplay=stack; run;
+proc sgplot data=diaRcd; vbar mhRcd  / group=Diabetes_binary groupdisplay=stack; run;
+
+title 'Grouped Bar Charts (binary variables)';
+proc sgplot data=dia; vbar Diabetes_binary / group=Sex; title "Sex"; run;
+proc sgplot data=dia; vbar Diabetes_binary / group=DiffWalk; run;
+proc sgplot data=dia; vbar Diabetes_binary / group=NoDocbcCost; title "NoDocbcCost"; run;
+proc sgplot data=dia; vbar Diabetes_binary / group=AnyHealthcare; title "AnyHealthcare"; run;
+proc sgplot data=dia; vbar Diabetes_binary / group=HvyAlcoholConsump; title "HvyAlcoholConsump"; run;
+proc sgplot data=dia; vbar Diabetes_binary / group=Veggies; title "Veggies"; run;
+proc sgplot data=dia; vbar Diabetes_binary / group=Fruits; title "Fruits"; run;
+proc sgplot data=dia; vbar Diabetes_binary / group=PhysActivity; title "PhysActivity"; run;
+proc sgplot data=dia; vbar Diabetes_binary / group=HeartDiseaseorAttack; run;
+proc sgplot data=dia; vbar Diabetes_binary / group=Stroke; run;
+proc sgplot data=dia; vbar Diabetes_binary / group=Smoker; title "Smoker"; run;
+proc sgplot data=dia; vbar Diabetes_binary / group=CholCheck; title "CholCheck"; run;
+proc sgplot data=dia; vbar Diabetes_binary / group=HighChol; title "HighChol"; run;
+proc sgplot data=dia; vbar Diabetes_binary / group=HighBP; title "HighBP"; run;
+
+/*======================================================================
+6) Step 3: Stepwise selection to build a best multivariable model
+======================================================================*/
+title "Stepwise Logistic Regression for Diabetes_binary (recoded variables)";
+
+proc logistic data=diaRcd;
+    class HighBP HighChol Stroke HeartDiseaseorAttack
+          CholCheck AnyHealthcare NoDocbcCost
+          Smoker PhysActivity Fruits Veggies HvyAlcoholConsump
+          GenHlth DiffWalk mhRcd phRcd bmiRcd
+          Sex Education Income / param=ref ref=first;
+
+    model Diabetes_binary(event='1') =
+          HighBP HighChol Stroke HeartDiseaseorAttack
+          bmiRcd GenHlth mhRcd phRcd DiffWalk
+          CholCheck AnyHealthcare NoDocbcCost
+          Sex Age Education Income
+          Smoker PhysActivity Fruits Veggies HvyAlcoholConsump
+          / selection=stepwise slentry=0.05 slstay=0.05;
+run;
+
+/*======================================================================
+7) Fit final selected model + diagnostics
+NOTE: Your submitted PDF used Leverage > 1, which can never happen since
+hat values are always < 1. This script uses a practical leverage cutoff:
+  leverage > 2 * mean(leverage)
+and Cook's D-like cbar > 1.
+======================================================================*/
+
+data diaRcd_id;
+    set diaRcd;
+    ObsID = _N_;
+run;
+
+title "Final Logistic Model with Diagnostics (example final model)";
+proc logistic data=diaRcd_id plots=all;
+    class HighBP HighChol bmiRcd GenHlth DiffWalk CholCheck / param=ref ref=first;
+    model Diabetes_binary(event='1') =
+          HighBP HighChol bmiRcd GenHlth DiffWalk CholCheck Age
+          / lackfit clodds=pl outroc=rocData influence;
+    output out=inf_out p=predicted cbar=cbar h=leverage;
+run;
+
+/* Influence screening */
+proc means data=inf_out noprint;
+    var leverage;
+    output out=_levstats mean=mean_lev;
+run;
+
+data _null_;
+    set _levstats;
+    call symputx('LEV_CUT', 2*mean_lev);
+run;
+
+data highInfluence okInfluence;
+    set inf_out;
+    if (cbar > 1) or (leverage > &LEV_CUT) then output highInfluence;
+    else output okInfluence;
+run;
+
+title "Potentially Influential Rows (cbar > 1 OR leverage > 2*mean(leverage))";
+proc print data=highInfluence noobs;
+    var ObsID Diabetes_binary Predicted cbar leverage;
+run;
+
+/* Confusion matrix @ 0.50 threshold */
+data Scored;
+    set inf_out;
+    Pred = (Predicted >= 0.50);
+run;
+
+title "Confusion Matrix (cutoff = 0.50)";
+proc freq data=Scored order=data;
+    tables Pred * Diabetes_binary / nopercent norow nocol nocum;
+run;
+
+/* ROC curve only */
+title "ROC Curve and Fit Statistics (final model)";
+proc logistic data=diaRcd plots(only)=roc;
+    class HighBP HighChol bmiRcd GenHlth DiffWalk CholCheck / param=ref ref=first;
+    model Diabetes_binary(event='1') =
+          HighBP HighChol bmiRcd GenHlth DiffWalk CholCheck Age;
+run;
+
+/* Spearman correlation matrix for final model predictors (numeric versions) */
+data corr_vars;
+    set diaRcd;
+    HighBP_num     = HighBP;
+    HighChol_num   = HighChol;
+    bmiRcd_num     = bmiRcd;
+    GenHlth_num    = GenHlth;
+    DiffWalk_num   = DiffWalk;
+    CholCheck_num  = CholCheck;
+run;
+
+title "Spearman Correlation Matrix (final model predictors)";
+proc corr data=corr_vars spearman plots=matrix(histogram);
+    var HighBP_num HighChol_num bmiRcd_num GenHlth_num DiffWalk_num CholCheck_num Age;
+run;
+
+/*======================================================================
+8) Step 4: Model-comparison variants (coding differences)
+======================================================================*/
+
+title "Stepwise model with NO variables recoded (DESC)";
+proc logistic data=diaRcd desc;
+    class HighBP HighChol Stroke HeartDiseaseorAttack
+          CholCheck AnyHealthcare NoDocbcCost
+          Smoker PhysActivity Fruits Veggies HvyAlcoholConsump
+          GenHlth DiffWalk Sex Education Income / param=ref ref=first;
+
+    model Diabetes_binary =
+          HighBP HighChol Stroke HeartDiseaseorAttack
+          BMI GenHlth MentHlth PhysHlth DiffWalk
+          CholCheck AnyHealthcare NoDocbcCost
+          Sex Age Education Income
+          Smoker PhysActivity Fruits Veggies HvyAlcoholConsump
+          / selection=stepwise slentry=0.05 slstay=0.05;
+run;
+
+title "Stepwise model (comparison): BMI 3 levels (bmiRcd2) + recoded MH/PH";
+proc logistic data=diaRcd desc;
+    class HighBP HighChol Stroke HeartDiseaseorAttack
+          CholCheck AnyHealthcare NoDocbcCost bmiRcd2 mhRcd phRcd
+          Smoker PhysActivity Fruits Veggies HvyAlcoholConsump
+          GenHlth DiffWalk Sex Education Income / param=ref ref=first;
+
+    model Diabetes_binary =
+          HighBP HighChol Stroke HeartDiseaseorAttack
+          bmiRcd2 mhRcd phRcd GenHlth DiffWalk
+          CholCheck AnyHealthcare NoDocbcCost
+          Sex Age Education Income
+          Smoker PhysActivity Fruits Veggies HvyAlcoholConsump
+          / selection=stepwise slentry=0.05 slstay=0.05;
+run;
+
+title "Stepwise model (FINAL): recoded BMI/MH/PH";
+proc logistic data=diaRcd desc;
+    class HighBP HighChol Stroke HeartDiseaseorAttack
+          CholCheck AnyHealthcare NoDocbcCost bmiRcd mhRcd phRcd
+          Smoker PhysActivity Fruits Veggies HvyAlcoholConsump
+          GenHlth DiffWalk Sex Education Income / param=ref ref=first;
+
+    model Diabetes_binary =
+          HighBP HighChol Stroke HeartDiseaseorAttack
+          bmiRcd mhRcd phRcd GenHlth DiffWalk
+          CholCheck AnyHealthcare NoDocbcCost
+          Sex Age Education Income
+          Smoker PhysActivity Fruits Veggies HvyAlcoholConsump
+          / selection=stepwise slentry=0.05 slstay=0.05;
+run;
+
+/* ROC curves for quick comparison (example forms from your submitted pages) */
+title "MODEL WITH NO VARIABLES RECODED (ROC)";
+proc logistic data=diaRcd plots(only)=roc;
+    class HighBP HighChol GenHlth DiffWalk / param=ref ref=first;
+    model Diabetes_binary(event='1') = GenHlth HighBP Age BMI HighChol DiffWalk;
+run;
+
+title "FINAL MODEL (ROC)";
+proc logistic data=diaRcd plots(only)=roc;
+    class HighBP HighChol bmiRcd GenHlth DiffWalk CholCheck / param=ref ref=first;
+    model Diabetes_binary(event='1') = HighBP HighChol bmiRcd GenHlth DiffWalk CholCheck Age;
+run;
+
+title "FINAL MODEL EXCEPT BMI 3 LEVELS (ROC)";
+proc logistic data=diaRcd plots(only)=roc;
+    class HighBP HighChol bmiRcd2 GenHlth DiffWalk CholCheck mhRcd / param=ref ref=first;
+    model Diabetes_binary(event='1') = HighBP HighChol bmiRcd2 GenHlth DiffWalk CholCheck Age mhRcd;
+run;
+
+/*======================================================================
+9) Step 4: Sex-stratified model comparisons
+======================================================================*/
+title "Stepwise model: Sex = 1";
+proc logistic data=diaRcd;
+    where Sex=1;
+    class HighBP HighChol Stroke HeartDiseaseorAttack
+          CholCheck AnyHealthcare NoDocbcCost
+          Smoker PhysActivity Fruits Veggies HvyAlcoholConsump
+          GenHlth DiffWalk mhRcd phRcd bmiRcd
+          Education Income / param=ref ref=first;
+
+    model Diabetes_binary(event='1') =
+          HighBP HighChol Stroke HeartDiseaseorAttack
+          bmiRcd GenHlth mhRcd phRcd DiffWalk
+          CholCheck AnyHealthcare NoDocbcCost
+          Age Education Income
+          Smoker PhysActivity Fruits Veggies HvyAlcoholConsump
+          / selection=stepwise slentry=0.05 slstay=0.05;
+run;
+
+title "Stepwise model: Sex = 0";
+proc logistic data=diaRcd;
+    where Sex=0;
+    class HighBP HighChol Stroke HeartDiseaseorAttack
+          CholCheck AnyHealthcare NoDocbcCost
+          Smoker PhysActivity Fruits Veggies HvyAlcoholConsump
+          GenHlth DiffWalk mhRcd phRcd bmiRcd
+          Education Income / param=ref ref=first;
+
+    model Diabetes_binary(event='1') =
+          HighBP HighChol Stroke HeartDiseaseorAttack
+          bmiRcd GenHlth mhRcd phRcd DiffWalk
+          CholCheck AnyHealthcare NoDocbcCost
+          Age Education Income
+          Smoker PhysActivity Fruits Veggies HvyAlcoholConsump
+          / selection=stepwise slentry=0.05 slstay=0.05;
+run;
+
+/* Example ROC for one sex (your page 10 shows Sex=0) */
+title "Sex = 0: ROC for an example selected model";
+proc logistic data=diaRcd plots(only)=roc;
+    where Sex=0;
+    class HighBP GenHlth bmiRcd mhRcd HighChol / param=ref ref=first;
+    model Diabetes_binary(event='1') = HighBP GenHlth bmiRcd Age mhRcd HighChol;
+run;
+
+ods graphics off;
+title;
+
+/* Last-page ROC (Sex = 1) from the screenshot PDF */
+title "Sex = 1: ROC for an example selected model";
+proc logistic data=diaRcd plots(only)=roc;
+    where Sex=1;
+    class GenHlth bmiRcd HighChol DiffWalk / param=ref ref=first;
+    model Diabetes_binary(event='1') = GenHlth Age bmiRcd HighChol DiffWalk;
+run;
+
